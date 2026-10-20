@@ -52,6 +52,7 @@ All available environment variables:
 #### Server Configuration
 - `API_HOST` (default: `0.0.0.0`) - The host/IP address the server binds to
 - `API_PORT` (default: `3000`) - The port the server listens on
+- `API_TOKEN` (default: empty) - Bearer token required on every endpoint except `/health`. Leave it empty to keep the API open. Separate several tokens with commas to rotate a token without downtime. A value that holds only whitespace or commas stops the server at startup, so a broken Secret cannot silently leave the API open.
 
 #### Scraper and Browser Defaults
 - `DEFAULT_CACHE` (default: `false`)
@@ -77,6 +78,61 @@ All available environment variables:
 - `DEFAULT_TIMEZONE` (default: empty)
 - `DEFAULT_HTTP_CREDENTIALS` (default: empty)
 - `DEFAULT_EXTRA_HTTP_HEADERS` (default: empty)
+
+### Authentication
+
+The API has no authentication until you set `API_TOKEN`. An open API gives
+anyone who can reach the port a browser that fetches any URL they name, from
+inside your network. Set a token before you expose the port.
+
+```bash
+docker run -d -p 3000:3000 \
+  -e API_TOKEN=your-long-random-token \
+  --name seleniumbase-api jez500/seleniumbase-scrapper
+```
+
+Callers then send the token in an `Authorization` header:
+
+```bash
+curl -H "Authorization: Bearer your-long-random-token" \
+  "http://localhost:3000/api/article?url=https://example.com"
+```
+
+What the check does:
+
+| Path | Token required |
+|------|----------------|
+| `/api/article` | yes |
+| `/` | yes |
+| `/health` | no |
+
+`/health` stays open on purpose, so Kubernetes startup and liveness probes keep
+working without a credential.
+
+Rejected requests return HTTP 401 with a `WWW-Authenticate: Bearer` header and
+the usual error body:
+
+```json
+{"detail": [{"type": "invalid_token", "msg": "The bearer token is not valid"}]}
+```
+
+The `type` field reads `missing_token` when there is no `Authorization` header,
+`invalid_authorization_header` when the header is not `Bearer <token>`, and
+`invalid_token` when the token does not match. A rejected request never starts
+a browser.
+
+Notes:
+
+- The token must travel in the `Authorization` header. A `?token=` query
+  parameter is **not** accepted, because query strings end up in access logs
+  and browser history.
+- To rotate a token, set both values, move your clients across, then drop the
+  old one: `-e API_TOKEN=new-token,old-token`.
+- When `API_TOKEN` is empty the server logs a warning at startup, so you can
+  spot an accidentally open deployment in the container logs.
+- Generate a token with `openssl rand -hex 32`.
+- In Kubernetes, put the token in a Secret and reference it with
+  `valueFrom.secretKeyRef`. Do not put it in the manifest directly.
 
 ### User Scripts
 
@@ -344,8 +400,10 @@ curl -X GET "http://localhost:3000/api/article?url=https://www.example.com" -o o
 - **Headless Browser**: Uses Chrome in headless mode for efficient scraping
 - **JavaScript Rendering**: Fully renders JavaScript-heavy pages
 - **Undetected Mode**: Uses SeleniumBase's undetected mode to bypass bot detection
+- **Bearer Token Auth**: Optional `API_TOKEN` guards every endpoint except `/health`
 - **Error Handling**: Proper error responses with meaningful messages
 - **Auto Cleanup**: Automatically closes browser drivers after each request
+- **Process Cleanup**: Tini runs as PID 1 and reaps orphaned browser processes
 
 ## Technical Details
 
@@ -353,6 +411,43 @@ curl -X GET "http://localhost:3000/api/article?url=https://www.example.com" -o o
 - **Browser**: Chrome (headless)
 - **Port**: 3000
 - **SeleniumBase Driver**: UC mode enabled for better compatibility
+- **Init process**: Tini
+
+### Process Cleanup
+
+Chrome starts many descendant processes. Some of them outlive their parent and
+get reparented to PID 1. PID 1 must reap them, or they stay in the process
+table as zombies until the container runs out of PIDs.
+
+The image therefore runs Tini as PID 1:
+
+```
+ENTRYPOINT ["/usr/bin/tini", "--", "/docker-entrypoint-api.sh"]
+```
+
+You do **not** need `docker run --init` or Compose `init: true`. Kubernetes
+gets the same reaping behaviour, because the init process is part of the image.
+Tini forwards signals, so a custom command and a graceful `docker stop` both
+still work.
+
+SeleniumBase 4.44.10 also abandons one chromedriver child process per driver
+start. It calls `driver.connect()` on a driver that already runs, which makes
+Selenium replace `Service.process` with a new `Popen` and drop the old one
+without a `wait()`. Python is that child's real parent, so Tini cannot reap it.
+The article endpoint reaps it after every scrape with
+`helpers.reap_abandoned_child_processes()`.
+
+Measured on `linux/amd64` with 10 scrapes of a local HTML page: zombies grew
+linearly at 12 per scrape before the fix, reaching 132. After the fix the count
+is 0 after every scrape. A 30-request run that included error paths stayed at 0.
+`docker stop` also improved, from the full 30-second timeout and exit code 137
+to under one second and exit code 143.
+
+The arm64 image was not measured. The `tini` package exists for arm64 in Ubuntu
+22.04, and the reaper does not depend on the architecture.
+
+Run `scripts/test-container-zombies` to check this yourself. See
+[Testing](#testing).
 
 ## Container Management
 
@@ -421,8 +516,11 @@ The project includes comprehensive test coverage for the API server, covering bo
 
 ### Test Structure
 
-- **api/tests/test_helpers.py** - Unit tests for helper functions (cache operations, parameter parsing, HTML extraction)
+- **api/tests/test_helpers.py** - Unit tests for helper functions (cache operations, parameter parsing, HTML extraction, child-process reaping)
 - **api/tests/test_endpoints.py** - Integration tests for API endpoints (/health, /, /api/article)
+- **api/tests/test_auth.py** - Unit tests for bearer token authentication
+- **scripts/test-container-zombies** - Container regression test that scrapes with a real browser and counts zombie processes
+- **scripts/test-container-auth** - Container test that checks the token over real HTTP
 
 ### Running Tests
 
@@ -463,6 +561,57 @@ python3 -m unittest tests.test_helpers.TestCacheFunctions -v
 # Run only /health endpoint tests
 python3 -m unittest tests.test_endpoints.TestHealthEndpoint -v
 ```
+
+#### Run the Container Regression Test
+
+This test starts a real container, scrapes a local HTML page many times with a
+real browser, and counts zombie processes inside the container after every
+scrape. It never reaches an external website. It removes the test container on
+every exit path.
+
+```bash
+# Build the image first
+docker build -t seleniumbase-scrapper:test .
+
+# Run the test. The second argument is the number of scrapes (default 10).
+./scripts/test-container-zombies seleniumbase-scrapper:test 10
+```
+
+The script exits 0 only when every check passes. It checks that PID 1 runs
+Tini, that repeated scrapes leave no zombie, that the unreachable-URL path and
+the browser start failure path leave no zombie, and that the container stops
+before the kill timeout.
+
+The test is not part of CI, because it builds the image and takes several
+minutes. Run it by hand after a change to the driver lifecycle, the entrypoint
+or the base image. Running it against an older image reproduces the leak and
+fails:
+
+```bash
+./scripts/test-container-zombies jez500/seleniumbase-scrapper:v1.0 10
+```
+
+#### Run the Container Auth Test
+
+This test starts two real containers, one with `API_TOKEN` set and one without
+it, and calls the API over HTTP. It checks that the token is required, that
+`/health` stays open, that a rejected request starts no browser, and that an
+empty `API_TOKEN` leaves the API open with a warning in the log. It removes both
+containers on every exit path.
+
+The test is not part of CI, because it builds the image and takes several
+minutes. CI runs the auth unit tests in `test_auth.py` and `test_endpoints.py`.
+Run this test by hand after a change to the auth code or the entrypoint.
+
+```bash
+# Build the image first
+docker build -t seleniumbase-scrapper:test .
+
+# Run the test
+./scripts/test-container-auth seleniumbase-scrapper:test
+```
+
+The script exits 0 only when every check passes.
 
 ### Test Coverage Summary
 
